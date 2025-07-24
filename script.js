@@ -15,6 +15,11 @@ const AUDIO_FILES_BASE_URL = RADIO_BASE_URL + 'audio/'; // 音频文件所在的
 // This is crucial for synchronizing playback with absolute time.
 let radioStartTime = null;
 
+// 预加载的触发时间点 (秒)
+const PRELOAD_THRESHOLD_SECONDS = 30;
+// 标记下一首是否已触发预加载，避免重复
+let nextTrackPreloadTriggered = false;
+
 document.addEventListener('DOMContentLoaded', initApp);
 
 function initApp() {
@@ -26,7 +31,8 @@ function initApp() {
     audioPlayer.addEventListener('play', updateCurrentInfo);
     audioPlayer.addEventListener('pause', updateCurrentInfo);
     audioPlayer.addEventListener('error', handleAudioError);
-    audioPlayer.addEventListener('canplay', handleCanPlay);
+    // 监听 timeupdate 事件来检查是否需要预加载下一首
+    audioPlayer.addEventListener('timeupdate', checkPreloadNextAudio);
 
     playlistDisplay.innerHTML = 'Loading radio schedule...';
     currentInfoDisplay.innerHTML = 'Loading radio schedule...';
@@ -53,13 +59,11 @@ async function loadCsvSchedule() {
             header: true,
             dynamicTyping: false,
             complete: function(results) {
-                // Filter out rows with missing data and parse time
                 schedule = results.data.filter(row => row.time && row.file)
                                        .map(row => {
-                                           const dtString = String(row.time); // Ensure it's a string
-                                           // Parse YYYYMMDDHHmmss string to Date object
+                                           const dtString = String(row.time);
                                            const year = parseInt(dtString.substring(0, 4));
-                                           const month = parseInt(dtString.substring(4, 6)) - 1; // Month is 0-indexed
+                                           const month = parseInt(dtString.substring(4, 6)) - 1;
                                            const day = parseInt(dtString.substring(6, 8));
                                            const hour = parseInt(dtString.substring(8, 10));
                                            const minute = parseInt(dtString.substring(10, 12));
@@ -67,15 +71,15 @@ async function loadCsvSchedule() {
                                            return {
                                                time: new Date(year, month, day, hour, minute, second),
                                                file: row.file,
-                                               url: AUDIO_FILES_BASE_URL + row.file, // Construct full URL using hardcoded path
-                                               duration: 0 // Will be set after metadata is loaded
+                                               url: AUDIO_FILES_BASE_URL + row.file,
+                                               duration: 0, // 初始时长未知
+                                               status: 'pending', // 'pending', 'metadata_loading', 'metadata_loaded', 'error'
+                                               preloaded: false // 用于标记是否已预加载音频数据
                                            };
                                        });
 
-                // Sort by time to ensure correct playback order
                 schedule.sort((a, b) => a.time.getTime() - b.time.getTime());
 
-                // Set the radio's "start time" to the timestamp of the very first audio file
                 if (schedule.length > 0) {
                     radioStartTime = schedule[0].time;
                     console.log('Radio broadcast starts at:', radioStartTime.toLocaleString());
@@ -85,10 +89,10 @@ async function loadCsvSchedule() {
 
                 console.log('Parsed CSV schedule with URLs:', schedule);
                 displayPlaylist();
-                currentInfoDisplay.innerHTML = 'CSV schedule loaded. Determining current position...';
-
-                // Preload durations for better seeking/synchronization
-                preloadAudioDurations();
+                currentInfoDisplay.innerHTML = 'CSV schedule loaded. Attempting to synchronize playback.';
+                
+                // 直接尝试同步播放，会在需要时懒加载第一个音频的元数据
+                synchronizePlayback();
             },
             error: function(err) {
                 console.error("Error parsing CSV:", err);
@@ -101,40 +105,61 @@ async function loadCsvSchedule() {
     }
 }
 
-async function preloadAudioDurations() {
-    let loadedCount = 0;
-    for (const item of schedule) {
-        try {
-            const tempAudio = new Audio();
-            tempAudio.src = item.url;
-            await new Promise((resolve, reject) => {
-                tempAudio.addEventListener('loadedmetadata', () => {
-                    item.duration = tempAudio.duration; // Store duration in seconds
-                    console.log(`Loaded metadata for ${item.file}: ${item.duration}s`);
-                    loadedCount++;
-                    currentInfoDisplay.innerHTML = `Loading audio metadata: ${loadedCount}/${schedule.length} files...`;
-                    resolve();
-                }, { once: true });
-                tempAudio.addEventListener('error', (e) => {
-                    console.error(`Error loading metadata for ${item.file}:`, e);
-                    currentInfoDisplay.innerHTML = `Error loading metadata for ${item.file}. See console.`;
-                    item.duration = 0; // Mark as unplayable or 0 duration
-                    resolve(); // Resolve to continue with other files
-                }, { once: true });
-                tempAudio.load();
-            });
-        } catch (error) {
-            console.error(`Promise error for ${item.file}:`, error);
-        }
+// 新增函数：加载单个音频文件的元数据和时长
+async function loadAudioMetadata(item) {
+    if (item.status === 'metadata_loaded' || item.status === 'metadata_loading') {
+        return item.duration;
     }
-    console.log('All audio durations preloaded.');
-    currentInfoDisplay.innerHTML = 'All audio metadata loaded. Attempting to synchronize playback.';
-    synchronizePlayback();
+    item.status = 'metadata_loading';
+    try {
+        const tempAudio = new Audio();
+        tempAudio.src = item.url;
+        await new Promise((resolve) => {
+            tempAudio.addEventListener('loadedmetadata', () => {
+                item.duration = tempAudio.duration;
+                item.status = 'metadata_loaded';
+                console.log(`Metadata loaded for ${item.file}: ${item.duration}s`);
+                resolve();
+            }, { once: true });
+            tempAudio.addEventListener('error', (e) => {
+                console.error(`Error loading metadata for ${item.file}:`, e);
+                item.duration = 0; // 标记为未知时长
+                item.status = 'error';
+                resolve(); // 即使出错也要 resolve，不阻塞后续流程
+            }, { once: true });
+            tempAudio.load(); // 仅加载元数据，不播放
+        });
+        return item.duration;
+    } catch (error) {
+        console.error(`Failed to load metadata for ${item.file}:`, error);
+        item.duration = 0;
+        item.status = 'error';
+        return 0;
+    }
 }
 
+// 新增函数：预加载下一个音频的二进制数据
+// 这里的 preloader 不会播放音频，仅用于触发浏览器缓存
+const audioPreloaders = new Map(); // 用于存储临时的 Audio 对象，避免被垃圾回收
+
+function preloadAudioData(item) {
+    if (item.preloaded || item.status === 'error' || !item.url) {
+        return;
+    }
+
+    if (!audioPreloaders.has(item.file)) {
+        console.log(`Preloading data for: ${item.file}`);
+        const preloader = new Audio();
+        preloader.src = item.url;
+        preloader.preload = 'auto'; // 提示浏览器尽可能多地预加载
+        preloader.load(); // 开始加载
+        audioPreloaders.set(item.file, preloader);
+        item.preloaded = true;
+    }
+}
 
 function displayPlaylist() {
-    playlistDisplay.innerHTML = ''; // Clear previous playlist
+    playlistDisplay.innerHTML = '';
     if (schedule.length === 0) {
         playlistDisplay.innerHTML = 'No valid data in CSV to display playlist.';
         return;
@@ -144,18 +169,28 @@ function displayPlaylist() {
         const div = document.createElement('div');
         div.classList.add('playlist-item');
         div.dataset.index = index;
+        // 显示时长为 'Loading...' 直到获取到实际时长
         div.textContent = `${formatDateTime(item.time)}: ${item.file} (Duration: ${item.duration ? formatTime(item.duration) : 'Loading...'})`;
         playlistDisplay.appendChild(div);
 
-        // Add click listener to jump to a specific track
-        div.addEventListener('click', () => {
+        // 点击播放列表项，跳到并播放该曲目
+        div.addEventListener('click', async () => {
             if (item.url) {
+                // 如果时长未知，先加载元数据
+                if (item.status !== 'metadata_loaded') {
+                    currentInfoDisplay.innerHTML = `Loading metadata for ${item.file}...`;
+                    await loadAudioMetadata(item);
+                    // 更新播放列表中的时长显示
+                    div.textContent = `${formatDateTime(item.time)}: ${item.file} (Duration: ${item.duration ? formatTime(item.duration) : 'N/A'})`;
+                }
                 currentPlayIndex = index;
                 audioPlayer.src = item.url;
-                audioPlayer.currentTime = 0; // Start from beginning of this track when clicked
+                audioPlayer.currentTime = 0; // 从头开始播放
                 audioPlayer.play();
                 highlightPlaylistItem(currentPlayIndex);
                 currentInfoDisplay.innerHTML = `Manually playing: ${item.file}`;
+                // 重置预加载标记，以便从新位置开始正确预加载
+                nextTrackPreloadTriggered = false;
             } else {
                 alert(`Audio URL for "${item.file}" not available.`);
             }
@@ -163,31 +198,40 @@ function displayPlaylist() {
     });
 }
 
-function synchronizePlayback() {
+// 核心同步逻辑
+async function synchronizePlayback() {
     if (!radioStartTime || schedule.length === 0) {
         currentInfoDisplay.innerHTML = 'Radio schedule not ready for synchronization.';
         return;
     }
 
     const now = new Date();
-    // Calculate total elapsed time since radio start
     const elapsedSecondsSinceRadioStart = (now.getTime() - radioStartTime.getTime()) / 1000;
 
     let foundIndex = -1;
     let seekTimeInCurrentTrack = 0;
-    let cumulativeOffset = 0; // Keep track of the total duration of tracks before the current one
 
     for (let i = 0; i < schedule.length; i++) {
         const item = schedule[i];
-        if (item.duration === 0) {
-            console.warn(`Skipping ${item.file} due to unknown duration.`);
+
+        // 如果时长未知，尝试加载元数据并等待，以便进行准确计算
+        if (item.status !== 'metadata_loaded' && item.status !== 'error') {
+            currentInfoDisplay.innerHTML = `Determining duration for ${item.file}...`;
+            await loadAudioMetadata(item);
+            // 更新播放列表中的时长显示
+            const playlistItemDiv = document.querySelector(`.playlist-item[data-index="${i}"]`);
+            if (playlistItemDiv) {
+                 playlistItemDiv.textContent = `${formatDateTime(item.time)}: ${item.file} (Duration: ${item.duration ? formatTime(item.duration) : 'N/A'})`;
+            }
+        }
+
+        if (item.duration === 0) { // 如果时长仍然未知或为0，跳过此项
+            console.warn(`Skipping ${item.file} due to unknown or zero duration.`);
             continue;
         }
 
-        // Calculate the absolute start time (in seconds from radioStartTime) for this item
         const itemStartTimeRelative = (item.time.getTime() - radioStartTime.getTime()) / 1000;
 
-        // Check if the current elapsed time falls within this track's absolute time slot
         if (elapsedSecondsSinceRadioStart >= itemStartTimeRelative &&
             elapsedSecondsSinceRadioStart < (itemStartTimeRelative + item.duration)) {
             
@@ -205,22 +249,36 @@ function synchronizePlayback() {
         audioPlayer.play().catch(error => {
             console.error("Autoplay failed:", error);
             currentInfoDisplay.innerHTML = `Autoplay blocked. Click play. Now scheduled: ${currentItem.file}`;
-            // If autoplay is blocked, just load it and let the user click play
         });
         highlightPlaylistItem(currentPlayIndex);
         currentInfoDisplay.innerHTML = `Synchronized to: ${currentItem.file} at ${formatTime(seekTimeInCurrentTrack)}`;
+        nextTrackPreloadTriggered = false; // 重置预加载标记
     } else {
-        // If elapsed time is before the first track or after the last track
+        // 如果当前时间不在任何预定播放时段内，从第一个有效曲目开始播放
         currentInfoDisplay.innerHTML = 'Not currently within any scheduled broadcast slot. Starting from beginning.';
-        currentPlayIndex = 0; // Start from the first track
-        if (schedule.length > 0 && schedule[0].url) {
-            audioPlayer.src = schedule[0].url;
+        currentPlayIndex = 0; 
+        while (currentPlayIndex < schedule.length && schedule[currentPlayIndex].status === 'error') {
+             currentPlayIndex++; // 跳过无法播放的曲目
+        }
+        if (currentPlayIndex < schedule.length && schedule[currentPlayIndex].url) {
+            const firstPlayableItem = schedule[currentPlayIndex];
+            // 确保第一个可播放曲目的元数据已加载
+            if (firstPlayableItem.status !== 'metadata_loaded') {
+                await loadAudioMetadata(firstPlayableItem);
+                const playlistItemDiv = document.querySelector(`.playlist-item[data-index="${currentPlayIndex}"]`);
+                if (playlistItemDiv) {
+                    playlistItemDiv.textContent = `${formatDateTime(firstPlayableItem.time)}: ${firstPlayableItem.file} (Duration: ${firstPlayableItem.duration ? formatTime(firstPlayableItem.duration) : 'N/A'})`;
+                }
+            }
+
+            audioPlayer.src = firstPlayableItem.url;
             audioPlayer.currentTime = 0;
             audioPlayer.play().catch(error => {
                 console.error("Autoplay failed:", error);
-                currentInfoDisplay.innerHTML = `Autoplay blocked. Click play. Starting: ${schedule[0].file}`;
+                currentInfoDisplay.innerHTML = `Autoplay blocked. Click play. Starting: ${firstPlayableItem.file}`;
             });
-            highlightPlaylistItem(0);
+            highlightPlaylistItem(currentPlayIndex);
+            nextTrackPreloadTriggered = false; // 重置预加载标记
         } else {
              currentInfoDisplay.innerHTML = 'No schedule or audio files to play.';
         }
@@ -228,23 +286,35 @@ function synchronizePlayback() {
 }
 
 
-function playNextAudio() {
+async function playNextAudio() {
     currentPlayIndex++;
     if (currentPlayIndex < schedule.length) {
         const nextItem = schedule[currentPlayIndex];
-        if (nextItem.url) {
+        // 确保下一首的元数据已加载
+        if (nextItem.status !== 'metadata_loaded' && nextItem.status !== 'error') {
+            currentInfoDisplay.innerHTML = `Loading metadata for next track: ${nextItem.file}...`;
+            await loadAudioMetadata(nextItem);
+            // 更新播放列表中的时长显示
+            const playlistItemDiv = document.querySelector(`.playlist-item[data-index="${currentPlayIndex}"]`);
+            if (playlistItemDiv) {
+                 playlistItemDiv.textContent = `${formatDateTime(nextItem.time)}: ${nextItem.file} (Duration: ${nextItem.duration ? formatTime(nextItem.duration) : 'N/A'})`;
+            }
+        }
+        
+        if (nextItem.url && nextItem.status !== 'error') {
             audioPlayer.src = nextItem.url;
-            audioPlayer.load(); // Load the next audio
+            audioPlayer.load(); // 预加载下一首音频的数据
             audioPlayer.play().catch(error => {
                  console.warn("Autoplay of next track failed:", error);
                  currentInfoDisplay.innerHTML = `Autoplay blocked for ${nextItem.file}. Click play.`;
             });
             highlightPlaylistItem(currentPlayIndex);
             updateCurrentInfo();
+            nextTrackPreloadTriggered = false; // 重置预加载标记
         } else {
-            console.error(`Next audio file URL missing for index ${currentPlayIndex}: ${nextItem.file}`);
-            currentInfoDisplay.innerHTML = `Error: Cannot play next file (${nextItem.file}). URL missing. Trying next...`;
-            // Skip this file if URL is missing
+            console.error(`Next audio file URL missing or error status for index ${currentPlayIndex}: ${nextItem.file}`);
+            currentInfoDisplay.innerHTML = `Error: Cannot play next file (${nextItem.file}). URL missing or error. Trying next...`;
+            // 跳过此文件，尝试播放再下一首
             playNextAudio();
         }
     } else {
@@ -254,11 +324,41 @@ function playNextAudio() {
     }
 }
 
+// 检查是否需要预加载下一首音频
+function checkPreloadNextAudio() {
+    // 确保有音频正在播放且有下一首
+    if (audioPlayer.paused || audioPlayer.ended || currentPlayIndex === -1 || !schedule[currentPlayIndex] || currentPlayIndex >= schedule.length - 1) {
+        return;
+    }
+
+    const currentItem = schedule[currentPlayIndex];
+    const nextItem = schedule[currentPlayIndex + 1];
+
+    if (!currentItem || !nextItem || nextTrackPreloadTriggered) {
+        return;
+    }
+    
+    // 如果当前曲目的时长未知，或者正在加载，则无法计算剩余时间，暂时不预加载
+    if (currentItem.status !== 'metadata_loaded' || currentItem.duration === 0) {
+        return;
+    }
+
+    const timeLeftInCurrentTrack = currentItem.duration - audioPlayer.currentTime;
+
+    // 如果当前曲目剩余时间小于预加载阈值，并且下一首曲目尚未被预加载
+    if (timeLeftInCurrentTrack <= PRELOAD_THRESHOLD_SECONDS && !nextItem.preloaded) {
+        console.log(`Time left in current track (${formatTime(timeLeftInCurrentTrack)}) is less than ${PRELOAD_THRESHOLD_SECONDS}s. Preloading next track: ${nextItem.file}`);
+        preloadAudioData(nextItem); // 触发预加载下一首音频的数据
+        nextTrackPreloadTriggered = true; // 标记已触发，避免重复预加载
+    }
+}
+
+
 function updateCurrentInfo() {
     if (currentPlayIndex !== -1 && schedule[currentPlayIndex]) {
         const currentItem = schedule[currentPlayIndex];
         const currentTime = audioPlayer.currentTime;
-        const duration = audioPlayer.duration;
+        const duration = audioPlayer.duration; // 这里的 duration 应该是实际加载的音频时长
         const progress = isNaN(currentTime) || isNaN(duration) ? '00:00 / 00:00' : `${formatTime(currentTime)} / ${formatTime(duration)}`;
         currentInfoDisplay.innerHTML = `Playing: ${currentItem.file} (${progress})`;
     } else if (!audioPlayer.paused) {
@@ -271,19 +371,18 @@ function updateCurrentInfo() {
 function handleAudioError(e) {
     console.error("Audio error:", e);
     const errorMsg = audioPlayer.error ? audioPlayer.error.message : 'Unknown audio error.';
-    currentInfoDisplay.innerHTML = `Audio playback error! (${errorMsg}). Check console for details. File: ${schedule[currentPlayIndex]?.file || 'N/A'}`;
-    // Optionally try to play the next audio if there's an error
-    // If the error happens during automatic playback (e.g., file not found), it's good to try the next one
+    const currentFile = schedule[currentPlayIndex]?.file || 'N/A';
+    currentInfoDisplay.innerHTML = `Audio playback error! (${errorMsg}). Check console for details. File: ${currentFile}`;
+    
+    // 如果是网络或源文件不支持的错误，尝试播放下一首
     if (e.target.error.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED || e.target.error.code === MediaError.MEDIA_ERR_NETWORK) {
-         console.warn("Attempting to play next audio due to error.");
+         console.warn(`Attempting to play next audio due to error with ${currentFile}.`);
+         // 标记当前出错的曲目为 error 状态，避免再次尝试
+         if (schedule[currentPlayIndex]) {
+             schedule[currentPlayIndex].status = 'error';
+         }
          playNextAudio();
     }
-}
-
-function handleCanPlay() {
-    // This event fires when enough data is available to play, but not necessarily enough to play to the end.
-    // We can use this to update the duration in the playlist if it wasn't preloaded,
-    // but the preloadAudioDurations is designed to handle this more comprehensively.
 }
 
 function highlightPlaylistItem(index) {
