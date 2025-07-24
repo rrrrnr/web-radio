@@ -8,7 +8,7 @@ let schedule = []; // Stores parsed CSV data with calculated start times
 let currentPlayIndex = -1; // Index of the currently playing item in the schedule
 
 // 硬编码基础 URL，根据您的 GitHub Pages 路径设置
-const RADIO_BASE_URL = 'https://rrrrnr.github.io/web-radio/refs/heads/main/';
+const RADIO_BASE_URL = 'https://raw.githubusercontent.com/rrrrnr/web-radio/refs/heads/main/';
 const AUDIO_FILES_BASE_URL = RADIO_BASE_URL + 'audio/'; // 音频文件所在的子目录
 
 // This variable will hold the start time of the "broadcast" based on the first item in the schedule.
