@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rrrrnr Radio Player</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+        audio {
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        #current-info {
+            border: 1px solid #ddd;
+            padding: 15px;
+            min-height: 50px;
+            background-color: #e9e9e9;
+            border-radius: 4px;
+            font-size: 1.1em;
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .playlist-item {
+            padding: 8px 0;
+            border-bottom: 1px dashed #eee;
+        }
+        .playlist-item.active {
+            background-color: yellow;
+            font-weight: bold;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>rrrrnr Radio Player</h1>
+
+        <p>This radio station is broadcasting from `rrrrnr.github.io/web-radio/`.</p>
+
+        <audio id="audioPlayer" controls></audio>
+
+        <h3>Currently Playing:</h3>
+        <div id="current-info">
+            Loading radio schedule...
+        </div>
+
+        <h3>Playback Schedule:</h3>
+        <div id="playlist">
+            Loading...
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
