@@ -40,7 +40,7 @@ async function loadCsvSchedule() {
     playlistDisplay.innerHTML = 'Loading...';
 
     // Assume table-2.csv is in the RADIO_BASE_URL
-    const csvUrl = RADIO_BASE_URL + 'table-2.csv';
+    const csvUrl = RADIO_BASE_URL + 'table.csv';
 
     try {
         const response = await fetch(csvUrl);
