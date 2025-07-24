@@ -8,7 +8,7 @@ let schedule = []; // Stores parsed CSV data with calculated start times
 let currentPlayIndex = -1; // Index of the currently playing item in the schedule
 
 // 硬编码基础 URL，根据您的 GitHub Pages 路径设置
-const RADIO_BASE_URL = 'https://rrrrnr.github.io/web-radio/';
+const RADIO_BASE_URL = 'https://rrrrnr.github.io/web-radio/refs/heads/main/';
 const AUDIO_FILES_BASE_URL = RADIO_BASE_URL + 'audio/'; // 音频文件所在的子目录
 
 // This variable will hold the start time of the "broadcast" based on the first item in the schedule.
@@ -39,7 +39,7 @@ async function loadCsvSchedule() {
     currentInfoDisplay.innerHTML = 'Loading CSV schedule...';
     playlistDisplay.innerHTML = 'Loading...';
 
-    // Assume table-2.csv is in the RADIO_BASE_URL
+    // Assume table.csv is in the RADIO_BASE_URL
     const csvUrl = RADIO_BASE_URL + 'table.csv';
 
     try {
@@ -97,7 +97,7 @@ async function loadCsvSchedule() {
         });
     } catch (error) {
         console.error("Failed to fetch CSV:", error);
-        currentInfoDisplay.innerHTML = `Failed to fetch CSV: ${error.message}. Make sure 'table-2.csv' is accessible at ${csvUrl}.`;
+        currentInfoDisplay.innerHTML = `Failed to fetch CSV: ${error.message}. Make sure 'table.csv' is accessible at ${csvUrl}.`;
     }
 }
 
